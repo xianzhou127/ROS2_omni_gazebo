@@ -1,0 +1,8 @@
+/install
+/build
+/log
+/src/axebot
+/src/omnidirectional_controllers
+
+.vscode
+
