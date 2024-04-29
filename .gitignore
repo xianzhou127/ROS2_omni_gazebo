@@ -3,6 +3,7 @@
 /log
 /src/axebot
 /src/omnidirectional_controllers
+/src/octomap_server2
 
 .vscode
 
