@@ -37,7 +37,7 @@ class SAC_countinuous():
 		with torch.no_grad():
 			state = torch.FloatTensor(state[np.newaxis,:]).to(self.dvc)
 			a, _ = self.actor(state, deterministic, with_logprob=False)
-		return a.cpu().numpy()[0]
+		return np.array(a.cpu().numpy()[0].tolist())
 
 	def train(self,):
 		s, a, r, s_next, dw = self.replay_buffer.sample(self.batch_size)
@@ -89,6 +89,7 @@ class SAC_countinuous():
 		for param, target_param in zip(self.q_critic.parameters(), self.q_critic_target.parameters()):
 			target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
+		return q_loss,a_loss,alpha_loss
 		'为什么没有V_net'
 		# R:在updated version里没有v_net，V就是E(Q)
 	def save(self,EnvName, timestep):

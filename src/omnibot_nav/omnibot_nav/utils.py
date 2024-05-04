@@ -50,7 +50,7 @@ def build_Covnet_q(input_channels, action_dim,output_dim,hidden_activation,outpu
 class Actor(nn.Module):
 	def __init__(self, state_dim, action_dim, hid_shape, hidden_activation=nn.ReLU, output_activation=nn.ReLU):
 		super(Actor, self).__init__()
-		# (96,96,3,256,256)
+		# (980,256,256)
 		layers = [state_dim] + list(hid_shape)
 
 		self.a_net = build_net(layers, hidden_activation, output_activation)

@@ -1,4 +1,3 @@
-
 import os
 from launch import LaunchDescription
 from launch.substitutions import LaunchConfiguration
