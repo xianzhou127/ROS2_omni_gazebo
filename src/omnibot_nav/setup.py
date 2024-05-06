@@ -21,7 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'envmodel = omnibot_nav.EnvModel:main',
-            'omnibot_nav = omnibot_nav.main:main'
+            'DRL_agent = omnibot_nav.main:main'
         ],
     },
 )

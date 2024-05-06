@@ -1,4 +1,4 @@
-from utils import Actor, Double_Q_Critic
+from omnibot_nav.utils import Actor, Double_Q_Critic
 import torch.nn.functional as F
 import numpy as np
 import torch

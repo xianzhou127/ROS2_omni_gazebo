@@ -2,10 +2,11 @@
  
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile,qos_profile_system_default,qos_profile_sensor_data
+from rclpy.qos import QoSProfile,qos_profile_system_default,qos_profile_sensor_data,qos_profile_services_default
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup,ReentrantCallbackGroup
 
+from rcl_interfaces.srv import GetParameters
 from nav_msgs.msg import Odometry,OccupancyGrid
 from geometry_msgs.msg import Twist,Pose,PoseStamped
 from gazebo_msgs.msg import ModelStates
@@ -13,13 +14,14 @@ from gazebo_msgs.srv import DeleteEntity,SpawnEntity,GetEntityState,SetEntitySta
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Empty
+from omnibot_msgs.srv import Reset,Step,Srvdone
+
 import tf2_ros
 import tf2_geometry_msgs
 
 
 import math
 import numpy as np
-import torch
 import time
 import xacro
 import os
@@ -55,46 +57,51 @@ def get_xml():
     return xacro.process_file(xacro_file, mappings={'robot_name_rc': robot_name}).toxml()
 
 class EnvModel(Node):
-    def __init__(self,map_name='easy_world',train_freq = 100,is_train = True ,is_test_env = False):
+    def __init__(self,is_test_env = False):
         # create node
-        rclpy.init()      
-        self.envmodel = rclpy.create_node('envmodel')
+        super().__init__("envmodel")
 
         self.agentrobot = robot_name
-        self.is_train = is_train
-        self.group = ReentrantCallbackGroup()  # 多线程
+        self.is_train = True    # 
+        self.train_freq = 1000  # unused
+        # self.group = ReentrantCallbackGroup()  # 多线程
 
         """************************************************************
         ** Initialise ROS publishers and subscribers
         ************************************************************"""
-        self.laser_sub = Node.create_subscription(self.envmodel,LaserScan,'/axebot_0/laser/scan',self.__laser_callback,qos_profile_sensor_data, callback_group = self.group)
-        self.odom_sub = Node.create_subscription(self.envmodel,Odometry,'/axebot_0/odom_trans',self.__odom_callback,QoSProfile(depth=5), callback_group = self.group)
-        if self.is_train:
-            self.target_sub = Node.create_subscription(self.envmodel,PoseStamped,'/goal_pose',self.__targetpose_callback,QoSProfile(depth=5), callback_group = self.group)
-        if self.is_train:
-            self.course_sub = Node.create_subscription(self.envmodel,PoseStamped,'/course_pose',self.__coursepose_callback,QoSProfile(depth=5), callback_group = self.group)
-        self.map_sub = Node.create_subscription(self.envmodel,OccupancyGrid,'/map',self.__map_callback,QoSProfile(depth=5), callback_group = self.group)
-        self.agent_pub = Node.create_publisher(self.envmodel,Twist,'/axebot_0/omnidirectional_controller/cmd_vel_unstamped',qos_profile_system_default)
+        self.laser_sub = self.create_subscription(LaserScan,'/axebot_0/laser/scan',self.__laser_callback,qos_profile_sensor_data)
+        self.odom_sub = self.create_subscription(Odometry,'/axebot_0/odom_trans',self.__odom_callback,QoSProfile(depth=5))
+        self.target_sub = self.create_subscription(PoseStamped,'/goal_pose',self.__targetpose_callback,QoSProfile(depth=5))
+        self.course_sub = self.create_subscription(PoseStamped,'/course_pose',self.__coursepose_callback,QoSProfile(depth=5))
+        self.map_sub = self.create_subscription(OccupancyGrid,'/map',self.__map_callback,QoSProfile(depth=5))
+        self.agent_pub = self.create_publisher(Twist,'/axebot_0/omnidirectional_controller/cmd_vel_unstamped',qos_profile_system_default)
 
         # controller frequency 20
-        self.control_timer = Node.create_timer(self.envmodel,0.05,self.run)
+        self.control_timer = self.create_timer(0.05,self.run)
 
         # train frequency
-        self.train_freq = Node.create_rate(self.envmodel,train_freq)
-        if is_test_env:
-            self.step_timer = Node.create_timer(self.envmodel,1,self.step)
+        self.train_rate = self.create_rate(1000)
+        # if is_test_env:
+        #     self.step_timer = self.create_timer(1,self.step)
 
         # gazebo
-        self.gazebo_get_state = Node.create_client(self.envmodel,GetEntityState,'/get_entity_state')
-        self.gazebo_set_state = Node.create_client(self.envmodel,SetEntityState,'/set_entity_state')
-        self.gazebo_spawn_entity = Node.create_client(self.envmodel,SpawnEntity, '/spawn_entity')
-        self.gazebo_delete_entity = Node.create_client(self.envmodel,DeleteEntity, '/delete_entity')
-        self.gazebo_reset_simulation = Node.create_client(self.envmodel,Empty, '/reset_simulation')
-        self.gazebo_reset_world = Node.create_client(self.envmodel,Empty, '/reset_world')
-        self.gazebo_pause = Node.create_client(self.envmodel,Empty,'/pause_physics')
-        self.gazebo_unpause = Node.create_client(self.envmodel,Empty,'/unpause_physics')
+        self.gazebo_get_state = self.create_client(GetEntityState,'/get_entity_state')
+        self.gazebo_set_state = self.create_client(SetEntityState,'/set_entity_state')
+        self.gazebo_spawn_entity = self.create_client(SpawnEntity, '/spawn_entity')
+        self.gazebo_delete_entity = self.create_client(DeleteEntity, '/delete_entity')
+        self.gazebo_reset_simulation = self.create_client(Empty, '/reset_simulation')
+        self.gazebo_reset_world = self.create_client(Empty, '/reset_world')
+        self.gazebo_pause = self.create_client(Empty,'/pause_physics')
+        self.gazebo_unpause = self.create_client(Empty,'/unpause_physics')
         self.robot_xml = get_xml()
 
+        # service
+        self.env_reset = self.create_service(Reset,'/env_reset',self.reset,qos_profile=qos_profile_services_default)
+        self.env_step = self.create_service(Step,'/env_step',self.step,qos_profile=qos_profile_services_default)
+        self.env_init = self.create_service(Srvdone,'/env_init',self.init,qos_profile=qos_profile_services_default)
+
+        # cline
+        self.get_params = self.create_client(GetParameters,'/DRL_agent/get_parameters')
         """************************************************************
         ** Initialise state
         ************************************************************"""
@@ -110,12 +117,12 @@ class EnvModel(Node):
         self.robot_state = np.zeros(6)                      # x,y,seta,vx,vy,w
         self.init_state = np.zeros(6)                       # x_init,y_init,seta_init,vx_init,vy_init,w_init
         self.init_state_cut = np.zeros(6)                   
-        self.target_state = np.zeros(4)                     # x_target,y_target,seta_target,d_agent2target
-        self.target_state_cut = np.zeros(4)                 # current rarget state
-        self.course_state = np.zeros(3)                     # x_course,y_course,d_agent2course
-        self.course_state_cut = np.zeros(3)
+        self.target_state = np.ones(4)                     # x_target,y_target,seta_target,d_agent2target
+        self.target_state_cut = np.ones(4)                 # current rarget state
+        self.course_state = np.ones(3)                     # x_course,y_course,d_agent2course
+        self.course_state_cut = np.ones(3)
         self.laser_state = np.ones(361)                    # laser sample,obstacle_distance
-        self.map_state = np.zeros(self.map_size)
+        self.map_state = np.ones(self.map_size)
         self.d_target = 0
         self.d_course = 0
         self.obstacle_distance = 1
@@ -128,7 +135,7 @@ class EnvModel(Node):
         
 
         self.action_dim = 3
-        self.action_space=[-2,2]
+        self.action_space=[-2.0,2.0]
         self.state_dim = 6+6+4+3+361+self.map_size
         self.d_target_idx = 6+6+4-1
         self.d_course_idx = 6+6+4+3-1
@@ -137,27 +144,60 @@ class EnvModel(Node):
         self.t_seta_idx = 6+6+3-1
         self._max_episode_steps = 1000
 
-        self.init_env()
-
-        # if is_test_env:
-        #     rclpy.spin(self.envmodel)
-        # else:
-            # executor = MultiThreadedExecutor(3)
-            # executor.add_node(self.envmodel)
-
+        # param
+        self.declare_parameters(
+            namespace='',
+            parameters= [
+                ('state_dim', self.state_dim),
+                ('action_dim', self.action_dim),
+                ('max_episode_steps', self._max_episode_steps),
+                ('action_space', self.action_space)
+            ]
+        )
 
 
     """*******************************************************************************
     ** Callback functions and relevant functions
     *******************************************************************************"""
-    def init_env(self):
-        self.reset()
-        # self.get_init_state()
+    def init(self,rquest,response):
+        # self.get_parameters()
+
+        # update train rate
+        # self.train_rate.destroy()
+        # self.train_rate = self.create_rate(self.train_freq)
+
         if self.is_train:
             self.set_target()
 
+        self.reset()
+        # self.get_init_state()
+        response.done = True
+        return response
+
+    def get_parameters(self):
+        while not self.get_params.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('env get params service not available, waiting again...')
+        request = GetParameters.Request()    
+        request.names = ['is_train','train_freq']
+        future = self.get_params.call_async(request)
+        
+        time.sleep(0.01)
+        print(0)
+        if future.done():
+            if future.result() is not None:
+                res = future.result()
+                # get params
+                self.is_train = res.values[0].bool_value
+                self.train_freq = res.values[1].integer_value
+                self.get_logger().info(f'is_train:{self.is_train}  train_freq:{self.train_freq}')
+                return
+            else:
+                self.get_logger().error(
+                    'Exception while calling service: {0}'.format(future.exception()))
+                print("ERROR getting reset service response!")
+
     def __map_callback(self,map):
-        self.envmodel.get_logger().info("get map")
+        self.get_logger().info("get map")
         self.map = map.data
 
     def __laser_callback(self,data):
@@ -168,10 +208,10 @@ class EnvModel(Node):
                     self.obstacle_distance = self.laser_state[i]
         self.obstacle_distance *= 10.0
         self.laser_state[360] = self.obstacle_distance
-        # self.envmodel.get_logger().info(f"obstacle distance{self.obstacle_distance}")
+        # self.get_logger().info(f"obstacle distance{self.obstacle_distance}")
 
     def __odom_callback(self,data):
-        # self.envmodel.get_logger().info("get odom")
+        # self.get_logger().info("get odom")
         # get seta
         roll, pitch, yaw =  quaternion2euler(data.pose.pose)
         
@@ -206,11 +246,11 @@ class EnvModel(Node):
         self.target_state[0] = random.uniform(5.5,8.0)    # x
         self.target_state[1] = 18.0                       # y
         self.target_state[2] = random.uniform(0.0,2*math.pi)   # seta
-        # self.envmodel.get_logger().info(f'target point:{self.target_state}')
+        # self.get_logger().info(f'target point:{self.target_state}')
 
     def get_init_state(self):
         self.init_state = self.robot_state
-        # self.envmodel.get_logger().info(f'target point:{self.target_state}')
+        # self.get_logger().info(f'target point:{self.target_state}')
 
     def get_target_state(self):
         self.target_state_cut = self.target_state
@@ -273,7 +313,7 @@ class EnvModel(Node):
         r_v_angular = -0.01 * (abs(angular_v))
 
         reward = r_d_target+ r_target_yaw + r_obstacle + r_v_angular
-        # self.envmodel.get_logger().info(f'{r_d_target}/{r_target_yaw}/{r_obstacle}/{r_v_angular}')
+        # self.get_logger().info(f'{r_d_target}/{r_target_yaw}/{r_obstacle}/{r_v_angular}')
         # arrive the target
         if done == 1:
             reward += 10000
@@ -284,8 +324,6 @@ class EnvModel(Node):
         return reward
     
     def get_state(self):
-        # run node one time and sub info
-        
 
         state = []
         # self.get_init_state()
@@ -294,26 +332,26 @@ class EnvModel(Node):
         self.get_course_state()
         # self.get_laser_state() laser_callback
         # self.get_map_state() 
+        for i in range(10):
+            state = list(self.robot_state) + list(self.init_state) + list (self.target_state) + list(self.course_state) + \
+                    list(self.laser_state) + list(self.map_state)
 
-        state = list(self.robot_state) + list(self.init_state) + list (self.target_state) + list(self.course_state) + \
-                list(self.laser_state) + list(self.map_state)
-
-        return np.array(state)
+        return state
 
     # def if_done(self):
 
     def delete_entity(self):
-        self.envmodel.get_logger().info('delete entity')
+        self.get_logger().info('delete entity')
         while not self.gazebo_delete_entity.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo delete entity service not available, waiting again...')
+            self.get_logger().info('gazebo delete entity service not available, waiting again...')
         objstate = DeleteEntity.Request()
         objstate.name = self.agentrobot
         self.gazebo_delete_entity.call_async(objstate)
 
     def spawn_entity(self):
-        self.envmodel.get_logger().info('spawn entity')
+        self.get_logger().info('spawn entity')
         while not self.gazebo_spawn_entity.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo spwan entity service not available, waiting again...')
+            self.get_logger().info('gazebo spwan entity service not available, waiting again...')
         objstate = SpawnEntity.Request()
         objstate.name = self.agentrobot
         objstate.xml  = self.robot_xml
@@ -330,37 +368,33 @@ class EnvModel(Node):
 
     def reset_simulation(self):
         while not self.gazebo_reset_simulation.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo_reset_simulation service not available, waiting again...')
+            self.get_logger().info('gazebo_reset_simulation service not available, waiting again...')
         req = Empty.Request()
         self.gazebo_reset_simulation.call_async(req)
     
     def reset_world(self):
         while not self.gazebo_reset_world.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo_reset_world service not available, waiting again...')
+            self.get_logger().info('gazebo_reset_world service not available, waiting again...')
         req = Empty.Request()
         self.gazebo_reset_world.call_async(req)
 
     def pause_sim(self):
         while not self.gazebo_pause.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo pause service not available, waiting again...')
+            self.get_logger().info('gazebo pause service not available, waiting again...')
         req = Empty.Request()
         self.gazebo_pause.call_async(req)
 
     def unpasue_sim(self):
         while not self.gazebo_unpause.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo unpause service not available, waiting again...')
+            self.get_logger().info('gazebo unpause service not available, waiting again...')
         req = Empty.Request()
         self.gazebo_unpause.call_async(req)
-
-
-    def action_sample(self):
-        return np.array([random.uniform(-2,2),random.uniform(-2,2),random.uniform(-2,2)])
-
     # reset model
-    def reset(self):
-        self.envmodel.get_logger().info('reset env')
+    def reset(self,request,response):
+        self.pause_sim()
+        self.get_logger().info('reset env')
         while not self.gazebo_set_state.wait_for_service(timeout_sec=1.0):
-            self.envmodel.get_logger().info('gazebo set state service not available, waiting again...')
+            self.get_logger().info('gazebo set state service not available, waiting again...')
         objstate = SetEntityState.Request()
         objstate.state.name = self.agentrobot
         objstate.state.pose.position.x = random.uniform(1.0,8.0)
@@ -380,33 +414,31 @@ class EnvModel(Node):
         objstate.state.reference_frame = ""
 
         self.gazebo_set_state.call_async(objstate)
-        # clean stack
-        for i in range(10):
-            rclpy.spin_once(self.envmodel)
-        state = self.get_state()
 
-        return state,{}
+        response.state = self.get_state()
+        self.unpasue_sim()
+        self.get_logger().info('reset finish')
+        return response
 
     # get s_,r,d,
-    def step(self, action = np.array([0.0,0.0,0.0])):
+    def step(self, request, response):
         # 1 step
-        self.action = action
+        self.action = request.actions
         self.run()
-        while rclpy.ok():
-            rclpy.spin_once(self.envmodel)
+        self.train_rate.sleep()
 
-            state = self.get_state()
-            done = self.get_result(state)
-            reward = self.get_reward(state,done)
-            # self.envmodel.get_logger().info(f'robot state: {state[0:6]} \n init state: {state[6:6+6]} \n target state: {state[12:12+4]} \n obstacle distance {state[380-1]}')
-            self.envmodel.get_logger().info(f'done: {done} reward: {reward} o_d: {state[380-1]}')
-            # self.envmodel.get_logger().info(f'{state[376:379]}')
-            
-            return state, reward, done, {}
+        response.state = self.get_state()
+        response.done = self.get_result(response.state)
+        response.reward = self.get_reward(response.state,response.done)
+        # self.get_logger().info(f'robot state: {state[0:6]} \n init state: {state[6:6+6]} \n target state: {state[12:12+4]} \n obstacle distance {state[380-1]}')
+        self.get_logger().info(f'done: {response.done} reward: {response.reward} o_d: {response.state[380-1]}')
+        # self.get_logger().info(f'{state[376:379]}')
+        
+        return response
     
     def close(self):
         # self.executor.shutdown()
-        self.envmodel.destroy_node()
+        self.destroy_node()
         rclpy.shutdown()
 
 def quaternion2euler(pose:Pose):
@@ -455,8 +487,12 @@ def euler2quaternion(euler):
 #     return euler
     
 def main(args=None):
+    rclpy.init(args=args)
     node = EnvModel(is_test_env=True)
-    
+    rclpy.spin(node)
+    # executor = MultiThreadedExecutor(3)
+    # executor.add_node(node)
+    # executor.spin()
 
 # if __name__ == "__main__":
 #     main()
