@@ -5,6 +5,3 @@ float32[] pre_action
 
 #response
 float32[] state
-bool      done
-bool      success
-float32   reward

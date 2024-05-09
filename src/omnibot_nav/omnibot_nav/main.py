@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup,ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import qos_profile_system_default
 
-from omnibot_msgs.srv import Reset,Step,Srvdone
+from omnibot_msgs.srv import State,Step,Srvdone
 from std_srvs.srv import Empty
 from omnibot_nav.SAC import SAC_countinuous,ReplayBuffer
 from omnibot_nav.utils import str2bool, evaluate_policy, Action_adapter, Action_adapter_reverse, Reward_adapter
-from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters,GetParameters
+from geometry_msgs.msg import Twist
 
 from datetime import datetime
 import os, shutil
@@ -32,16 +35,16 @@ parser.add_argument('--is_train', type=str2bool, default=True, help='if is trun'
 
 parser.add_argument('--seed', type=int, default=0, help='random seed')
 parser.add_argument('--Max_train_steps', type=int, default=int(5e6), help='Max training steps')
-parser.add_argument('--save_interval', type=int, default=int(10e3), help='Model saving interval, in steps.')
+parser.add_argument('--save_interval', type=int, default=int(10e4), help='Model saving interval, in steps.')
 parser.add_argument('--eval_interval', type=int, default=int(1e3), help='Model evaluating interval, in steps.')
-parser.add_argument('--update_every', type=int, default=500, help='Training Frequency, in stpes')
-parser.add_argument('--train_freq', type=int, default=50, help='Training frequency per second')
+parser.add_argument('--update_every', type=int, default=100, help='Training Frequency, in stpes')
+parser.add_argument('--train_freq', type=int, default=100, help='Training frequency per second')
 
 parser.add_argument('--gamma', type=float, default=0.99, help='Discounted Factor')
-parser.add_argument('--net_width', type=int, default=256, help='Hidden net width, s_dim-400-300-a_dim')
+parser.add_argument('--net_width', type=int, default=512, help='Hidden net width, s_dim-400-300-a_dim')
 parser.add_argument('--a_lr', type=float, default=3e-4, help='Learning rate of actor')
 parser.add_argument('--c_lr', type=float, default=3e-4, help='Learning rate of critic')
-parser.add_argument('--batch_size', type=int, default=256, help='batch_size of training')
+parser.add_argument('--batch_size', type=int, default=1024, help='batch_size of training')
 parser.add_argument('--buffer_size', type=int, default=int(1e6), help='batch_size of training')
 parser.add_argument('--alpha', type=float, default=0.12, help='Entropy coefficient')
 parser.add_argument('--adaptive_alpha', type=str2bool, default=True, help='Use adaptive_alpha or Not')
@@ -70,19 +73,28 @@ class DRLagent(Node):
             ]
         )   
         
+        group = ReentrantCallbackGroup()
+        # publisher
+        self.agent_pub = self.create_publisher(Twist,'/axebot_0/omnidirectional_controller/cmd_vel_unstamped',qos_profile_system_default)
+
+        # controller frequency 20
+        self.control_timer = self.create_timer(0.05,self.run)
+
         # client
-        self.reset = self.create_client(Reset,'/env_reset')
-        self.step  = self.create_client(Step,'/env_step')
-        self.init  = self.create_client(Srvdone,'/env_init')
-        self.get_params = self.create_client(GetParameters,'/envmodel/get_parameters')
+        self.reset = self.create_client(Empty,'/env_reset',callback_group=group)
+        self.step  = self.create_client(Step,'/env_step',callback_group=group)
+        self.init  = self.create_client(Empty,'/env_init',callback_group=group)
+        self.state = self.create_client(State,'/env_state',callback_group=group)
+        self.get_params = self.create_client(GetParameters,'/envmodel/get_parameters',callback_group=group)
 
         # rate
         self.train_rate = self.create_rate(opt.train_freq)
 
         # gazebo 
-        self.gazebo_pause = self.create_client(Empty,'/pause_physics')
-        self.gazebo_unpause = self.create_client(Empty,'/unpause_physics')
+        self.gazebo_pause = self.create_client(Empty,'/pause_physics',callback_group=group)
+        self.gazebo_unpause = self.create_client(Empty,'/unpause_physics',callback_group=group)
 
+        self.action = [0.0,0.0,0.0]
         self.env_init()
         self.get_env_params()
 
@@ -90,7 +102,7 @@ class DRLagent(Node):
         self.get_logger().info('env init start')
         while not self.init.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('env init service not available, waiting again...')
-        request = Reset.Request()
+        request = Empty.Request()
         future = self.reset.call_async(request)
         while rclpy.ok():
             rclpy.spin_once(self)
@@ -104,10 +116,22 @@ class DRLagent(Node):
                     print("ERROR getting init service response!")
 
     def env_reset(self):
+        # reset
         while not self.reset.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('env reset service not available, waiting again...')
-        request = Reset.Request()
-        future = self.reset.call_async(request)
+        request = Empty.Request()
+        self.reset.call_async(request)
+
+        time.sleep(0.5)
+
+        # get state
+        while not self.state.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('env state service not available, waiting again...')
+        request = State.Request()
+        request.action = [0.0,0.0,0.0]
+        request.pre_action = self.action
+        future = self.state.call_async(request)
+
         while rclpy.ok():
             rclpy.spin_once(self)
             if future.done():
@@ -119,11 +143,19 @@ class DRLagent(Node):
                         'Exception while calling service: {0}'.format(future.exception()))
                     print("ERROR getting reset service response!")
     
-    def env_step(self,actions):
+    def env_step(self,action):
+        # control
+        self.pre_action = self.action
+        self.action = action
+        self.run()
+        time.sleep(0.03)
+
+        # get s,r,d
         while not self.step.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('env step service not available, waiting again...')
         request = Step.Request()
-        request.actions = actions
+        request.action = self.action
+        request.pre_action = self.pre_action
         future = self.step.call_async(request)
         
         while rclpy.ok():
@@ -131,7 +163,7 @@ class DRLagent(Node):
             if future.done():
                 if future.result() is not None:
                     res = future.result()
-                    return np.array(res.state),res.reward,res.done,{}
+                    return np.array(res.state),res.reward,res.done,res.success,{}
                 else:
                     self.get_logger().error(
                         'Exception while calling service: {0}'.format(future.exception()))
@@ -168,6 +200,14 @@ class DRLagent(Node):
     def action_sample(self):
         return np.array([random.uniform(-2,2),random.uniform(-2,2),random.uniform(-2,2)])
 
+    # pub velocity command
+    def run(self):
+        cmd = Twist()
+        cmd.linear.x = self.action[0]
+        cmd.linear.y = self.action[1]
+        cmd.angular.z = self.action[2]
+        self.agent_pub.publish(cmd)
+
     def pause_sim(self):
         while not self.gazebo_pause.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('gazebo pause service not available, waiting again...')
@@ -184,18 +224,10 @@ class DRLagent(Node):
         """
         s[]
         a[0.0,0.0,0.0]: v-x,v-y,w-z
-        done: 0-continue,1-win,2-default
+        done: bool
+        success: bool
         r: reward
         """
-
-        # Seed Everything
-        env_seed = opt.seed
-        torch.manual_seed(opt.seed)
-        torch.cuda.manual_seed(opt.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        print("Random Seed: {}".format(opt.seed))
-
         # # Build SummaryWriter to record training curves
         if opt.write:
             from torch.utils.tensorboard import SummaryWriter
@@ -209,16 +241,17 @@ class DRLagent(Node):
         if not os.path.exists('model'): os.mkdir('model')
         agent = SAC_countinuous(**vars(opt)) # var: transfer argparse to dictionary
         if opt.Loadmodel: agent.load(BrifEnvName[opt.EnvIndex], opt.ModelIdex)
-        
+
         total_steps = 0
+        total_episode = 0
         progress_bar = tqdm(total=opt.Max_train_steps)
 
         while total_steps < opt.Max_train_steps:
             s, info = self.env_reset()  # Do not use opt.seed directly, or it can overfit to opt.seed
-            done = 0
-            e_q_loss ,e_a_loss,e_alpha_loss = 0,0,0
+            done = False
+            q_loss , a_loss, alpha_loss, e_reward = 0,0,0,0
 
-            while done != 2:
+            while not done:
 
                 if total_steps < (5*opt.max_e_steps):
                     act = self.action_sample()  # act∈[-max,max]
@@ -226,12 +259,13 @@ class DRLagent(Node):
                 else:
                     a = agent.select_action(s, deterministic=False)  # a∈[-2,2]
                     act = Action_adapter(a, opt.max_action)  # act∈[-max,max]
-                s_next, r, done, info = self.env_step(list(act))  # dw: dead&win; tr: truncated  这里会阻塞
-                # print(s_next[0:2])
+                s_next, r, done, success, info = self.env_step(list(act))  # dw: dead&win; tr: truncated  这里会阻塞
+                # print(f"{done} {success}")
 
-                agent.replay_buffer.add(s, a, r, s_next, done)
+                agent.replay_buffer.add(s, a, r, s_next, done, success)
                 s = s_next
                 total_steps += 1
+                e_reward += r
                 progress_bar.update(1)      #进度条更新
 
                 '''train if it's time'''
@@ -240,25 +274,18 @@ class DRLagent(Node):
                     self.pause_sim()
                     for j in range(opt.update_every):
                         q_loss , a_loss, alpha_loss = agent.train()
-                        e_q_loss += q_loss
-                        e_a_loss += a_loss
-                        e_alpha_loss += alpha_loss
-                    self.unpasue_sim()
 
-                '''record & log'''
-                if total_steps % opt.eval_interval == 0:
-                    self.pause_sim()
-                    # ep_r = evaluate_policy(eval_env, agent, turns=3)
-                    # if opt.write: writer.add_scalar('ep_r', ep_r, global_step=total_steps)
-                    if opt.write: writer.add_scalar('e_q_loss', e_q_loss, global_step=total_steps)
-                    if opt.write: writer.add_scalar('e_a_loss', e_a_loss, global_step=total_steps)
-                    if opt.write: writer.add_scalar('e_alpha_loss', e_alpha_loss, global_step=total_steps)
+                    '''record'''
+                    if opt.write: 
+                        writer.add_scalar('q_loss', q_loss, global_step=total_steps)
+                        writer.add_scalar('a_loss', a_loss, global_step=total_steps)
+                        writer.add_scalar('alpha_loss', alpha_loss, global_step=total_steps)
                     # print(f'EnvName:{BrifEnvName[opt.EnvIndex]}, Steps: {int(total_steps/1000)}k, Episode Reward:{ep_r}')
                     progress_bar.set_postfix({
                         # 'return' : '%.3f' % (ep_r),
-                        'e_q_loss' : '%.3f' % (e_q_loss),
-                        'e_a_loss' : '%.3f' % (e_a_loss),
-                        'e_alpha_loss' : '%.3f' % (e_alpha_loss),
+                        'q_loss' : '%.3f' % (q_loss),
+                        'a_loss' : '%.3f' % (a_loss),
+                        'alpha_loss' : '%.3f' % (alpha_loss),
                     })
                     self.unpasue_sim()
 
@@ -268,10 +295,15 @@ class DRLagent(Node):
                     agent.save(BrifEnvName[opt.EnvIndex], int(total_steps/1000))
                     self.unpasue_sim()
 
-                t = time.time()
-                print(int(round(t * 1000)))    #毫秒级时间戳
+                # t = time.time()
+                # print(int(round(t * 1000)))    #毫秒级时间戳
                 time.sleep(1/opt.train_freq)
                 # env.train_freq.sleep()
+            
+            total_episode += 1
+
+            if opt.write: 
+                writer.add_scalar('e_reward', e_reward, global_step=total_episode)
 
 
 def main():
@@ -280,10 +312,13 @@ def main():
     '''train'''
     agent = DRLagent()
     agent.train()
-    try:
-        rclpy.spin(agent)
-    finally:
-        rclpy.shutdown()
+    executor = MultiThreadedExecutor(3)
+    executor.add_node(agent)
+    executor.spin()
+    # try:
+    #     rclpy.spin(agent)
+    # finally:
+    #     rclpy.shutdown()
     # def train():
     #     total_steps = 0
     #     progress_bar = tqdm(total=opt.Max_train_steps)

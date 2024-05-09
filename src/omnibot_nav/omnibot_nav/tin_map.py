@@ -155,15 +155,15 @@ class OptMap(object):
             try:
                 contours  = find_contours(tmp_binary_map, epsilon)
                 triangles = counters_to_triangles(contours)
+                triangles_last = triangles
             except:
                 break
 
             print("epsilon = ", epsilon, " len(triangles) = ", len(triangles))
-            if ( len(triangles) >= max_triangle_num):
+            if ( len(triangles) >= max_triangle_num) :
                 triangles_last = triangles
                 epsilon += 1
             else:
-
                 break
 
         self.triangle_map = triangles_last

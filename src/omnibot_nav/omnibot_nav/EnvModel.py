@@ -14,7 +14,7 @@ from gazebo_msgs.srv import DeleteEntity,SpawnEntity,GetEntityState,SetEntitySta
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Empty
-from omnibot_msgs.srv import Reset,Step,Srvdone
+from omnibot_msgs.srv import State,Step,Srvdone
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -30,7 +30,7 @@ import cv2
 from ament_index_python.packages import get_package_share_directory
 from scipy.spatial.transform import Rotation as R
 from threading import Thread
-# from tin_map import OptMap
+from omnibot_nav.tin_map import OptMap
 # import sys
 # sys.path.append('/opt/ros/humble/lib/gazebo_ros/')
 # from spawn_entity import SpawnEntityNode
@@ -64,8 +64,8 @@ class EnvModel(Node):
         self.agentrobot = robot_name
         self.is_train = True    # 
         self.train_freq = 1000  # unused
-        # self.group = ReentrantCallbackGroup()  # 多线程
 
+        self.declare_parameter('map_name','easy_world')
         """************************************************************
         ** Initialise ROS publishers and subscribers
         ************************************************************"""
@@ -73,12 +73,9 @@ class EnvModel(Node):
         self.odom_sub = self.create_subscription(Odometry,'/axebot_0/odom_trans',self.__odom_callback,QoSProfile(depth=5))
         self.target_sub = self.create_subscription(PoseStamped,'/goal_pose',self.__targetpose_callback,QoSProfile(depth=5))
         self.course_sub = self.create_subscription(PoseStamped,'/course_pose',self.__coursepose_callback,QoSProfile(depth=5))
-        self.map_sub = self.create_subscription(OccupancyGrid,'/map',self.__map_callback,QoSProfile(depth=5))
-        self.agent_pub = self.create_publisher(Twist,'/axebot_0/omnidirectional_controller/cmd_vel_unstamped',qos_profile_system_default)
+        # self.map_sub = self.create_subscription(OccupancyGrid,'/map',self.__map_callback,QoSProfile(depth=5))
 
-        # controller frequency 20
-        self.control_timer = self.create_timer(0.05,self.run)
-
+        self.target_pub = self.create_publisher(PoseStamped,'/target_pose',QoSProfile(depth=5))
         # train frequency
         self.train_rate = self.create_rate(1000)
         # if is_test_env:
@@ -96,47 +93,57 @@ class EnvModel(Node):
         self.robot_xml = get_xml()
 
         # service
-        self.env_reset = self.create_service(Reset,'/env_reset',self.reset,qos_profile=qos_profile_services_default)
+        self.env_reset = self.create_service(Empty,'/env_reset',self.reset,qos_profile=qos_profile_services_default)
         self.env_step = self.create_service(Step,'/env_step',self.step,qos_profile=qos_profile_services_default)
-        self.env_init = self.create_service(Srvdone,'/env_init',self.init,qos_profile=qos_profile_services_default)
+        self.env_init = self.create_service(Empty,'/env_init',self.init,qos_profile=qos_profile_services_default)
+        self.env_state = self.create_service(State,'/env_state',self.get_state,qos_profile=qos_profile_services_default)
 
         # cline
         self.get_params = self.create_client(GetParameters,'/DRL_agent/get_parameters')
+
+        # params
+        self.map_name = self.get_parameter('map_name').get_parameter_value().string_value
+        print(self.map_name)
         """************************************************************
         ** Initialise state
         ************************************************************"""
         # map
-        # cvmap = cv2.imread(map_path + '/' + map_name+".pgm", cv2.IMREAD_GRAYSCALE)
-        # self.map = OptMap(cvmap)
-        # self.map.create_triangle_map(100)
-        # self.map_size = len(self.map.triangle_map)
-        self.map_size = 600
+        cvmap = cv2.imread(map_path + '/' + self.map_name +".pgm", cv2.IMREAD_GRAYSCALE)
+        # print(cvmap.shape)
+        self.map = OptMap(cvmap)
+        self.map.create_triangle_map(100)
+        self.map_state = np.array(self.map.triangle_map).reshape(-1)
+        self.map_size = len(self.map_state)
+        # print(self.map.triangle_map)
+        # self.map_size = 600
 
         # reset value
         # original agent situation
         self.robot_state = np.zeros(6)                      # x,y,seta,vx,vy,w
         self.init_state = np.zeros(6)                       # x_init,y_init,seta_init,vx_init,vy_init,w_init
         self.init_state_cut = np.zeros(6)                   
-        self.target_state = np.ones(4)                     # x_target,y_target,seta_target,d_agent2target
-        self.target_state_cut = np.ones(4)                 # current rarget state
-        self.course_state = np.ones(3)                     # x_course,y_course,d_agent2course
-        self.course_state_cut = np.ones(3)
-        self.laser_state = np.ones(361)                    # laser sample,obstacle_distance
-        self.map_state = np.ones(self.map_size)
+        self.target_state = np.zeros(4)                     # x_target,y_target,seta_target,d_agent2target
+        self.target_state_cut = np.zeros(4)                 # current rarget state
+        self.course_state = np.zeros(3)                     # x_course,y_course,d_agent2course
+        self.course_state_cut = np.zeros(3)
+        self.laser_state = np.zeros(361)                    # laser sample,obstacle_distance
         self.d_target = 0
         self.d_course = 0
         self.obstacle_distance = 1
 
+        
+
         self.r          = 0.0                                  # reward
         self.action        = np.zeros(3)                         # action [vx,vy,w]
-        self.done       = 0                                # done
+        self.done       = False                                # done
+        self.success       = False                                # success
 
         self.dis      = 1.0  # 位置精度-->判断是否到达目标的距离
         
 
         self.action_dim = 3
         self.action_space=[-2.0,2.0]
-        self.state_dim = 6+6+4+3+361+self.map_size
+        self.state_dim = 6+6+4+3+361+self.map_size+6    # + action[3] pre_action[3]
         self.d_target_idx = 6+6+4-1
         self.d_course_idx = 6+6+4+3-1
         self.d_obstacle_idx = 6+6+4+3+361-1
@@ -169,9 +176,7 @@ class EnvModel(Node):
         if self.is_train:
             self.set_target()
 
-        self.reset()
         # self.get_init_state()
-        response.done = True
         return response
 
     def get_parameters(self):
@@ -222,6 +227,7 @@ class EnvModel(Node):
         self.robot_state[3] = data.twist.twist.linear.x
         self.robot_state[4] = data.twist.twist.linear.y
         self.robot_state[5] = data.twist.twist.angular.z
+        # self.get_logger().info(f"odom update {self.robot_state[0]}")
 
     def __targetpose_callback(self,data):
         print("get target pose")
@@ -233,20 +239,24 @@ class EnvModel(Node):
     def __coursepose_callback(self,data):
         self.course_state[0] = data.pose.position.x
         self.course_state[1] = data.pose.position.y
-        
-    # pub velocity command
-    def run(self):
-        cmd = Twist()
-        cmd.linear.x = self.action[0]
-        cmd.linear.y = self.action[1]
-        cmd.angular.z = self.action[2]
-        self.agent_pub.publish(cmd)
 
     def set_target(self):
-        self.target_state[0] = random.uniform(5.5,8.0)    # x
-        self.target_state[1] = 18.0                       # y
-        self.target_state[2] = random.uniform(0.0,2*math.pi)   # seta
+        if self.map_name == "hard_world":
+            self.target_state[0] = random.uniform(5.5,8.0)    # x
+            self.target_state[1] = random.uniform(17.9,18.1)                       # y
+            self.target_state[2] = random.uniform(0.0,2*math.pi)   # seta
+        elif self.map_name == "easy_world":
+            self.target_state[0] = random.uniform(0.0,2.7)    # x
+            self.target_state[1] = random.uniform(4.5,4.7)                       # y
+            self.target_state[2] = random.uniform(0.0,2*math.pi)   # seta
         # self.get_logger().info(f'target point:{self.target_state}')
+        self.get_logger().info(f'target pose {self.target_state}')
+        target_pose = PoseStamped()
+        target_pose.pose.position.x = self.target_state[0] 
+        target_pose.pose.position.y = self.target_state[1] 
+        target_pose.pose.orientation.z = self.target_state[2]
+        target_pose.header.frame_id = 'map' 
+        self.target_pub.publish(target_pose)
 
     def get_init_state(self):
         self.init_state = self.robot_state
@@ -274,69 +284,73 @@ class EnvModel(Node):
         self.course_state_cut[2] = 0
 
     def get_result(self,state):
-        done = 0
+        done = False
+        success = False
         # win distance_error < 1cm degree_error < 1 degree
         if state[self.d_target_idx] <= 0.01 and abs(state[self.r_seta_idx] - state[self.t_seta_idx])/math.pi*180 <= 1:
-            done =  1
+            done = True
+            success = True
         # lose
         elif state[self.d_obstacle_idx] < 0.14: #obstacle_distance < 1cm ,
-            done = 2
+            done = True
+            success = False
         # elif self.map.is_in_ob_by_binary(state[0:2]):
         #     done = 2
-        else:
-            done = 0
-        return done
 
-    def get_reward(self,state,done):
+        return done,success
+
+    def get_reward(self,state,done,success):
+        
         target_dis = state[self.d_target_idx]         # [0,1]
         target_yaw = abs(state[self.r_seta_idx] - state[self.t_seta_idx])/math.pi*180         # [0,360]
         angular_v = state[6-1]
         course_dis = state[self.d_course_idx]
         obstacle_dis = state[self.d_obstacle_idx] # [0.12,10]
 
-        # [-1,0] distance to target
-        r_d_target = -1 * target_dis       
+        # [-2,0] distance to target
+        r_d_target = -2 * target_dis       
 
-        # [-0.72,0] 
-        r_target_yaw = -0.002 * target_yaw     
+        # [-0.9,0] 
+        if target_dis < 0.2:
+            r_target_yaw = -0.001 * target_yaw     
+        else:
+            r_target_yaw = 0
 
-        # [-0.05,-0.025] distance to obstacle
+        # [-0.005,-0.0025] distance to obstacle
         if obstacle_dis >= 0.20 and obstacle_dis < 0.4:
-            r_obstacle = -0.01 * 1/obstacle_dis
-        # [-0.67,-0.5] 
-        elif obstacle_dis >= 0.15 and obstacle_dis < 0.20:
+            r_obstacle = -0.001 * 1/obstacle_dis
+        # [-0.067,-0.05] 
+        elif obstacle_dis >= 0.14 and obstacle_dis < 0.20:
             r_obstacle = -0.1 * 1/obstacle_dis
         else:
             r_obstacle = 0
 
         # [-0.02,0] lower angular velocity
-        r_v_angular = -0.01 * (abs(angular_v))
+        # r_v_angular = -0.01 * (abs(angular_v))
+        r_v_angular = 0
 
         reward = r_d_target+ r_target_yaw + r_obstacle + r_v_angular
-        # self.get_logger().info(f'{r_d_target}/{r_target_yaw}/{r_obstacle}/{r_v_angular}')
+        self.get_logger().info(f'{r_d_target}/{r_target_yaw}/{r_obstacle}/{r_v_angular}')
         # arrive the target
-        if done == 1:
+        if done == True and success == True:
             reward += 10000
         # have a collision
-        elif done == 2:
+        elif done == True and success == False:
             reward += -10000
 
         return reward
     
-    def get_state(self):
-
-        state = []
+    def get_state(self,request,response):
         # self.get_init_state()
         # self.get_robot_state() robot_callback
         self.get_target_state()
         self.get_course_state()
         # self.get_laser_state() laser_callback
         # self.get_map_state() 
-        for i in range(10):
-            state = list(self.robot_state) + list(self.init_state) + list (self.target_state) + list(self.course_state) + \
-                    list(self.laser_state) + list(self.map_state)
+        response.state = list(self.robot_state) + list(self.init_state_cut) + list (self.target_state_cut) + list(self.course_state_cut) + \
+                list(self.laser_state) + list(self.map_state) + list(request.action) + list(request.pre_action)
 
-        return state
+        return response
 
     # def if_done(self):
 
@@ -397,10 +411,14 @@ class EnvModel(Node):
             self.get_logger().info('gazebo set state service not available, waiting again...')
         objstate = SetEntityState.Request()
         objstate.state.name = self.agentrobot
-        objstate.state.pose.position.x = random.uniform(1.0,8.0)
+        if self.map_name == "easy_world":
+            objstate.state.pose.position.x = random.uniform(0.0,2.7)
+        elif self.map_name == "hard_world":
+            objstate.state.pose.position.x = random.uniform(1.0,8.0)
         objstate.state.pose.position.y = 0.0
         objstate.state.pose.position.z = 0.0
-        quaternion = euler2quaternion([0.0,0.0,random.uniform(0.0,2*math.pi)])
+        yaw = random.uniform(0.0,2*math.pi)
+        quaternion = euler2quaternion([0.0,0.0,yaw])
         objstate.state.pose.orientation.x = quaternion[0]
         objstate.state.pose.orientation.y = quaternion[1]
         objstate.state.pose.orientation.z = quaternion[2]
@@ -414,8 +432,15 @@ class EnvModel(Node):
         objstate.state.reference_frame = ""
 
         self.gazebo_set_state.call_async(objstate)
+        time.sleep(0.1)
+        # reset init state
+        self.init_state[0] = objstate.state.pose.position.x
+        self.init_state[2] = yaw
+        self.init_state_cut = self.init_state
 
-        response.state = self.get_state()
+        # reset target state
+        self.set_target()
+
         self.unpasue_sim()
         self.get_logger().info('reset finish')
         return response
@@ -423,15 +448,17 @@ class EnvModel(Node):
     # get s_,r,d,
     def step(self, request, response):
         # 1 step
-        self.action = request.actions
-        self.run()
-        self.train_rate.sleep()
-
-        response.state = self.get_state()
-        response.done = self.get_result(response.state)
-        response.reward = self.get_reward(response.state,response.done)
+        # self.train_rate.sleep()
+        action = State.Request()
+        action.action = request.action
+        action.pre_action = request.pre_action
+        state = State.Response()
+        response.state = self.get_state(action,state).state
+        response.done,response.success = self.get_result(response.state)
+        response.reward = self.get_reward(response.state,response.done,response.success)
+        self.get_logger().info(f'{response.done} {response.success}')
         # self.get_logger().info(f'robot state: {state[0:6]} \n init state: {state[6:6+6]} \n target state: {state[12:12+4]} \n obstacle distance {state[380-1]}')
-        self.get_logger().info(f'done: {response.done} reward: {response.reward} o_d: {response.state[380-1]}')
+        # self.get_logger().info(f'done: {response.done} reward: {response.reward} o_d: {response.state[380-1]}')
         # self.get_logger().info(f'{state[376:379]}')
         
         return response
@@ -490,9 +517,11 @@ def main(args=None):
     rclpy.init(args=args)
     node = EnvModel(is_test_env=True)
     rclpy.spin(node)
-    # executor = MultiThreadedExecutor(3)
+    # executor = MultiThreadedExecutor(1)
     # executor.add_node(node)
     # executor.spin()
+    node.destroy_node()
+    rclpy.shutdown()
 
 # if __name__ == "__main__":
 #     main()

@@ -23,7 +23,7 @@ endif()
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/Step.srv"
-  "srv/Reset.srv"
+  "srv/State.srv"
   "srv/Srvdone.srv"
 )
 

@@ -8,7 +8,7 @@
 `ros2 run omnibot_nav envmodel`
 
 #### 加载静态地图
-`ros2 run nav2_map_server map_server --ros-args --param yaml_filename:=map/easy_map.yaml`
+`ros2 run nav2_map_server map_server --ros-args --param yaml_filename:=ros2_omni_gazebo/src/axebot/axebot_description/world/easy_world.yaml`
 `ros2 lifecycle set /map_server configure`
 `ros2 lifecycle set /map_server activate`
 
